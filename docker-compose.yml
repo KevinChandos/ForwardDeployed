@@ -1,0 +1,211 @@
+# =============================================================================
+# docker-compose.yml — Bookworm API local / staging stack
+#
+# Services
+# ─────────
+#   postgres   PostgreSQL 16 — primary datastore.
+#              Starts first; owns the named volume bookworm_pgdata.
+#              An init script (deploy/postgres/init/) creates the application
+#              role and grants CONNECT on first boot only.
+#
+#   flyway     Flyway Community — runs all migrations from Scripts/Flyway/ and
+#              exits with code 0 on success.  Declared as a dependency of `api`
+#              via `service_completed_successfully` so the API never starts
+#              against an un-migrated schema.
+#
+#   api        Spring Boot application — starts after Flyway finishes and after
+#              postgres is healthy.  Exposes port 8080 externally.
+#
+# Usage
+# ─────
+#   cp .env.example .env          # fill in secrets
+#   docker compose up --build     # first run (builds the image)
+#   docker compose up -d          # subsequent runs (detached)
+#   docker compose down -v        # tear down including volumes
+#
+# WHY separate flyway service instead of Spring Boot auto-migration:
+#   Keeping migrations in a dedicated container lets you:
+#     • run `docker compose run flyway migrate` independently for CI/CD pipelines
+#     • pin the Flyway version independently of Spring Boot
+#     • retry a failed migration without restarting the full application
+# =============================================================================
+
+services:
+
+  # ── PostgreSQL ──────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: bookworm-postgres
+    restart: unless-stopped
+
+    environment:
+      POSTGRES_DB:       ${POSTGRES_DB:-bookworm}
+      POSTGRES_USER:     ${POSTGRES_USER:-bookworm}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}
+
+    ports:
+      # Expose only on loopback in staging; remove the binding entirely in
+      # production where no direct DB access should be allowed from outside.
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+
+    volumes:
+      # Named volume persists data across container restarts and recreations.
+      - bookworm_pgdata:/var/lib/postgresql/data
+      # Init scripts run exactly once on a fresh (empty) data volume.
+      # WHY: separates infrastructure bootstrapping (roles, extensions) from
+      # schema versioning (Flyway), matching the production DBA workflow.
+      - ./deploy/postgres/init:/docker-entrypoint-initdb.d:ro
+
+    healthcheck:
+      # pg_isready polls the postmaster socket; -U must match POSTGRES_USER.
+      # interval: check every 10 s after the start-period has elapsed.
+      # retries: 5 allows up to 50 s of database startup before marking
+      #          dependents as blocked.
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-bookworm} -d ${POSTGRES_DB:-bookworm}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+    networks:
+      - bookworm-net
+
+  # ── Flyway migrations ───────────────────────────────────────────────────────
+  flyway:
+    image: flyway/flyway:10-alpine
+    container_name: bookworm-flyway
+
+    # WHY command flags:
+    #   -url             JDBC URL inside the compose network (service hostname).
+    #   -user/-password  Application credentials (not superuser).
+    #   -locations       Points to the bind-mounted scripts directory.
+    #   -connectRetries  Retries up to 10 times (10 s apart) if postgres isn't
+    #                    ready yet, providing belt-and-suspenders on top of the
+    #                    depends_on health check.
+    #   migrate          Run pending migrations; no-op if schema is current.
+    command: >
+      -url=jdbc:postgresql://postgres:5432/${POSTGRES_DB:-bookworm}
+      -user=${POSTGRES_USER:-bookworm}
+      -password=${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}
+      -locations=filesystem:/flyway/sql
+      -connectRetries=10
+      -baselineOnMigrate=false
+      migrate
+
+    volumes:
+      # Mount the Flyway scripts directory read-only into the container.
+      - ./Scripts/Flyway:/flyway/sql:ro
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+    networks:
+      - bookworm-net
+
+  # ── Bookworm API ─────────────────────────────────────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      # Cache the builder stage independently so CI can pull it across jobs.
+      target: runtime
+    image: bookworm-api:${APP_VERSION:-latest}
+    container_name: bookworm-api
+    restart: unless-stopped
+
+    environment:
+      # ── Datasource ───────────────────────────────────────────────────────────
+      # WHY SPRING_DATASOURCE_URL overrides application.yml at runtime:
+      #   The hostname "postgres" resolves to the postgres service inside the
+      #   compose network; localhost would not reach the DB container.
+      SPRING_DATASOURCE_URL:                  jdbc:postgresql://postgres:5432/${POSTGRES_DB:-bookworm}
+      SPRING_DATASOURCE_USERNAME:             ${POSTGRES_USER:-bookworm}
+      SPRING_DATASOURCE_PASSWORD:             ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}
+      SPRING_DATASOURCE_DRIVER_CLASS_NAME:    org.postgresql.Driver
+
+      # HikariCP pool sizing — keep lean for single-node local/staging.
+      SPRING_DATASOURCE_HIKARI_MAXIMUM_POOL_SIZE:        ${DB_POOL_SIZE:-10}
+      SPRING_DATASOURCE_HIKARI_MINIMUM_IDLE:             ${DB_POOL_MIN_IDLE:-2}
+      SPRING_DATASOURCE_HIKARI_CONNECTION_TIMEOUT:       30000
+      SPRING_DATASOURCE_HIKARI_IDLE_TIMEOUT:             600000
+      SPRING_DATASOURCE_HIKARI_MAX_LIFETIME:             1800000
+
+      # ── JPA / Hibernate ───────────────────────────────────────────────────────
+      # WHY validate: Flyway owns schema; Hibernate must never alter it.
+      SPRING_JPA_HIBERNATE_DDL_AUTO:          validate
+      SPRING_JPA_SHOW_SQL:                    "false"
+
+      # ── Flyway — disabled in app; migrations already run by the flyway service ─
+      # WHY: running Flyway twice (container + Spring auto-run) causes a race and
+      # can fail with "Unable to acquire Flyway advisory lock" on concurrent deploys.
+      SPRING_FLYWAY_ENABLED:                  "false"
+
+      # ── JWT ──────────────────────────────────────────────────────────────────
+      SPRING_SECURITY_JWT_SECRET:             ${JWT_SECRET:?JWT_SECRET must be set in .env}
+      SPRING_SECURITY_JWT_ACCESS_TOKEN_TTL_SECONDS:   ${JWT_ACCESS_TTL:-900}
+      SPRING_SECURITY_JWT_REFRESH_TOKEN_TTL_SECONDS:  ${JWT_REFRESH_TTL:-604800}
+
+      # ── CORS ─────────────────────────────────────────────────────────────────
+      BOOKWORM_SECURITY_CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-http://localhost:3000}
+
+      # ── Actuator ─────────────────────────────────────────────────────────────
+      MANAGEMENT_ENDPOINTS_WEB_EXPOSURE_INCLUDE: health,info,metrics
+
+      # ── Logging ──────────────────────────────────────────────────────────────
+      LOGGING_LEVEL_IO_BOOKWORM:              ${LOG_LEVEL:-INFO}
+      LOGGING_LEVEL_ORG_HIBERNATE_SQL:        WARN
+
+      # ── JVM flags (used by ENTRYPOINT) ───────────────────────────────────────
+      JAVA_OPTS: >-
+        -XX:+UseContainerSupport
+        -XX:MaxRAMPercentage=75.0
+        -XX:+ExitOnOutOfMemoryError
+        -Djava.security.egd=file:/dev/./urandom
+
+    ports:
+      - "${API_PORT:-8080}:8080"
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+      flyway:
+        condition: service_completed_successfully
+
+    healthcheck:
+      # Mirror the Dockerfile HEALTHCHECK so Docker Compose reports the service
+      # as healthy only after the Spring Boot actuator is live.
+      test: >
+        wget -qO- http://localhost:8080/v1/actuator/health
+        | grep -q '"status":"UP"'
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+    # WHY mem_limit: prevents a single runaway container from starving other
+    # services or the host OS.  Tune per deployment environment.
+    deploy:
+      resources:
+        limits:
+          memory: ${API_MEM_LIMIT:-512m}
+        reservations:
+          memory: 256m
+
+    networks:
+      - bookworm-net
+
+# ── Named volumes ──────────────────────────────────────────────────────────────
+volumes:
+  # bookworm_pgdata persists across container stop/start but is removed by
+  # `docker compose down -v`.  For production, bind-mount a host path or use
+  # a managed volume driver instead.
+  bookworm_pgdata:
+    driver: local
+
+# ── Networks ───────────────────────────────────────────────────────────────────
+networks:
+  # A dedicated bridge network isolates bookworm services from other local
+  # containers and avoids port conflicts on the default bridge.
+  bookworm-net:
+    driver: bridge

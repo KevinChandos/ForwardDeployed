@@ -1,0 +1,360 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  BookWorm API — Amazon RDS PostgreSQL 16 (Primary Multi-AZ + Read Replica).
+  Creates a custom parameter group, DB subnet group, security group, primary
+  instance, and a read replica in a separate AZ.  Deletion protection is
+  enabled by default in prod to prevent accidental data loss.
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Parameters
+# ──────────────────────────────────────────────────────────────────────────────
+Parameters:
+  Environment:
+    Type: String
+    AllowedValues: [dev, staging, prod]
+    Description: Deployment environment.
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC that hosts the private subnets.
+
+  PrivateSubnet1Id:
+    Type: AWS::EC2::Subnet::Id
+    Description: Private subnet in AZ-a for the DB subnet group.
+
+  PrivateSubnet2Id:
+    Type: AWS::EC2::Subnet::Id
+    Description: Private subnet in AZ-b for the DB subnet group (Multi-AZ standby).
+
+  AppRunnerSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: >
+      Security group attached to the App Runner VPC connector.  Only this SG
+      is permitted inbound to PostgreSQL (port 5432).
+
+  DBMasterUsername:
+    Type: String
+    Default: bookworm_admin
+    Description: Master username for the RDS instance.
+    NoEcho: false   # Not sensitive — actual password is in Secrets Manager
+
+  DBMasterUserPassword:
+    Type: String
+    NoEcho: true
+    Description: >
+      Master password.  In production, rotate via Secrets Manager Lambda
+      rotator.  Pass this only for initial stack creation; subsequent
+      credential management is handled by Secrets Manager.
+    MinLength: 16
+    ConstraintDescription: Must be at least 16 characters.
+
+  DBInstanceClass:
+    Type: String
+    Default: db.t4g.medium
+    AllowedValues:
+      - db.t4g.micro
+      - db.t4g.small
+      - db.t4g.medium
+      - db.t4g.large
+      - db.r7g.large
+    Description: >
+      RDS instance class.  Use db.t4g.micro/small for dev/staging to reduce
+      cost; db.t4g.medium or larger for production.
+
+  ReplicaInstanceClass:
+    Type: String
+    Default: db.t4g.small
+    AllowedValues:
+      - db.t4g.micro
+      - db.t4g.small
+      - db.t4g.medium
+    Description: Instance class for the read replica.
+
+  AllocatedStorageGB:
+    Type: Number
+    Default: 100
+    MinValue: 20
+    MaxValue: 500
+    Description: Initial allocated storage in GB (gp3).
+
+  MaxAllocatedStorageGB:
+    Type: Number
+    Default: 500
+    MinValue: 100
+    MaxValue: 2000
+    Description: Upper limit for storage auto-scaling.
+
+  MultiAZEnabled:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: >
+      Enable Multi-AZ standby.  Set to false in dev/staging to reduce cost;
+      always true in production.
+
+  CreateReadReplica:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: >
+      Whether to provision a read replica.  Disable in dev/staging to reduce
+      cost.
+
+  DeletionProtectionEnabled:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: >
+      Protects the instance from accidental deletion.  Set to false only in
+      non-production environments where teardown is expected.
+
+  BackupRetentionDays:
+    Type: Number
+    Default: 7
+    MinValue: 1
+    MaxValue: 35
+    Description: Number of days to retain automated backups.
+
+  KmsKeyId:
+    Type: String
+    Default: ""
+    Description: >
+      Optional ARN of a customer-managed KMS key for RDS encryption at rest.
+      Leave blank to use the default AWS-managed key (aws/rds).
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Conditions
+# ──────────────────────────────────────────────────────────────────────────────
+Conditions:
+  IsMultiAZ: !Equals [!Ref MultiAZEnabled, "true"]
+  ShouldCreateReplica: !Equals [!Ref CreateReadReplica, "true"]
+  HasCustomKmsKey: !Not [!Equals [!Ref KmsKeyId, ""]]
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Resources
+# ──────────────────────────────────────────────────────────────────────────────
+Resources:
+
+  # ---------------------------------------------------------------------------
+  # Security Group — allows only App Runner SG inbound on port 5432
+  # ---------------------------------------------------------------------------
+  RDSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "BookWorm RDS inbound — ${Environment}"
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref AppRunnerSecurityGroupId
+          Description: PostgreSQL access from App Runner VPC connector only
+      # No outbound rules — RDS does not need to initiate outbound connections
+      SecurityGroupEgress: []
+      Tags:
+        - Key: Name
+          Value: !Sub "sg-bookworm-rds-${Environment}"
+        - Key: Application
+          Value: bookworm-api
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ---------------------------------------------------------------------------
+  # DB Subnet Group — private subnets only, no public accessibility
+  # ---------------------------------------------------------------------------
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: !Sub "BookWorm private DB subnets — ${Environment}"
+      SubnetIds:
+        - !Ref PrivateSubnet1Id
+        - !Ref PrivateSubnet2Id
+      Tags:
+        - Key: Application
+          Value: bookworm-api
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ---------------------------------------------------------------------------
+  # Custom Parameter Group — pg16-bookworm-prod
+  # Tuned for the db.t4g.medium baseline; slow-query logging and SSL enforced.
+  # ---------------------------------------------------------------------------
+  DBParameterGroup:
+    Type: AWS::RDS::DBParameterGroup
+    Properties:
+      Description: !Sub "BookWorm PostgreSQL 16 custom params — ${Environment}"
+      Family: postgres16
+      Parameters:
+        # Buffer memory — sized for t4g.medium (4 GB RAM)
+        shared_buffers: "128MB"
+        # Per-query sort/hash memory
+        work_mem: "8MB"
+        # Logical replication support if a read replica or CDC consumer is added
+        wal_level: "logical"
+        # Log any query exceeding 1 second (ships to CloudWatch via RDS logging)
+        log_min_duration_statement: "1000"
+        # Audit trail: record every new connection and disconnection
+        log_connections: "1"
+        log_disconnections: "1"
+        # Force TLS-only connections — clients without ssl=true will be rejected
+        ssl: "1"
+      Tags:
+        - Key: Application
+          Value: bookworm-api
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ---------------------------------------------------------------------------
+  # Primary RDS Instance
+  # Multi-AZ deploys a synchronous standby in PrivateSubnet2 automatically.
+  # Performance Insights and Enhanced Monitoring are enabled for observability.
+  # ---------------------------------------------------------------------------
+  DBPrimary:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot   # Creates a final snapshot before deletion
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      DBInstanceIdentifier: !Sub "bookworm-${Environment}-primary"
+      DBName: bookworm
+      Engine: postgres
+      EngineVersion: "16"
+      DBInstanceClass: !Ref DBInstanceClass
+      StorageType: gp3
+      AllocatedStorage: !Ref AllocatedStorageGB
+      MaxAllocatedStorage: !Ref MaxAllocatedStorageGB
+      StorageEncrypted: true
+      KmsKeyId: !If [HasCustomKmsKey, !Ref KmsKeyId, !Ref "AWS::NoValue"]
+      MasterUsername: !Ref DBMasterUsername
+      MasterUserPassword: !Ref DBMasterUserPassword
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VPCSecurityGroups:
+        - !Ref RDSSecurityGroup
+      DBParameterGroupName: !Ref DBParameterGroup
+      MultiAZ: !If [IsMultiAZ, true, false]
+      PubliclyAccessible: false
+      Port: 5432
+      # Automated backups with 7-day PITR window
+      BackupRetentionPeriod: !Ref BackupRetentionDays
+      PreferredBackupWindow: "02:00-03:00"
+      PreferredMaintenanceWindow: "sun:03:00-sun:04:00"
+      # Performance Insights — free tier covers 7-day retention
+      EnablePerformanceInsights: true
+      PerformanceInsightsRetentionPeriod: 7
+      # Enhanced monitoring at 60-second granularity for I/O and OS metrics
+      MonitoringInterval: 60
+      MonitoringRoleArn: !GetAtt RDSEnhancedMonitoringRole.Arn
+      # Ship PostgreSQL logs to CloudWatch for slow-query and error analysis
+      EnableCloudwatchLogsExports:
+        - postgresql
+        - upgrade
+      # Guard against accidental stack-delete wiping the production database
+      DeletionProtection: !If [HasCustomKmsKey, true, !Equals [!Ref DeletionProtectionEnabled, "true"]]
+      CopyTagsToSnapshot: true
+      Tags:
+        - Key: Application
+          Value: bookworm-api
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ---------------------------------------------------------------------------
+  # Read Replica — same region, different AZ
+  # Offloads catalogue/search/recommendation read traffic from the primary.
+  # Conditionally created; omit in dev/staging via CreateReadReplica=false.
+  # ---------------------------------------------------------------------------
+  DBReadReplica:
+    Type: AWS::RDS::DBInstance
+    Condition: ShouldCreateReplica
+    DeletionPolicy: Delete   # Replica can be safely deleted; no data loss
+    UpdateReplacePolicy: Delete
+    Properties:
+      DBInstanceIdentifier: !Sub "bookworm-${Environment}-replica"
+      SourceDBInstanceIdentifier: !Ref DBPrimary
+      DBInstanceClass: !Ref ReplicaInstanceClass
+      StorageType: gp3
+      PubliclyAccessible: false
+      VPCSecurityGroups:
+        - !Ref RDSSecurityGroup
+      # Read replica inherits the parameter group from the primary automatically
+      EnablePerformanceInsights: true
+      PerformanceInsightsRetentionPeriod: 7
+      MonitoringInterval: 60
+      MonitoringRoleArn: !GetAtt RDSEnhancedMonitoringRole.Arn
+      EnableCloudwatchLogsExports:
+        - postgresql
+      Tags:
+        - Key: Application
+          Value: bookworm-api
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Role
+          Value: read-replica
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ---------------------------------------------------------------------------
+  # IAM Role for RDS Enhanced Monitoring
+  # RDS requires this role to publish OS-level metrics to CloudWatch.
+  # ---------------------------------------------------------------------------
+  RDSEnhancedMonitoringRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "bookworm-rds-monitoring-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: monitoring.rds.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonRDSEnhancedMonitoringRole
+      Tags:
+        - Key: Application
+          Value: bookworm-api
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Outputs
+# ──────────────────────────────────────────────────────────────────────────────
+Outputs:
+  DBPrimaryEndpoint:
+    Description: Primary RDS endpoint (write traffic)
+    Value: !GetAtt DBPrimary.Endpoint.Address
+    Export:
+      Name: !Sub "${AWS::StackName}-DBPrimaryEndpoint"
+
+  DBPrimaryPort:
+    Description: PostgreSQL port (always 5432)
+    Value: !GetAtt DBPrimary.Endpoint.Port
+    Export:
+      Name: !Sub "${AWS::StackName}-DBPrimaryPort"
+
+  DBReplicaEndpoint:
+    Condition: ShouldCreateReplica
+    Description: Read replica RDS endpoint (read-only traffic)
+    Value: !GetAtt DBReadReplica.Endpoint.Address
+    Export:
+      Name: !Sub "${AWS::StackName}-DBReplicaEndpoint"
+
+  RDSSecurityGroupId:
+    Description: Security group ID attached to both RDS instances
+    Value: !Ref RDSSecurityGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-RDSSecurityGroupId"
+
+  DBSubnetGroupName:
+    Description: DB subnet group name (shared with any future RDS instances)
+    Value: !Ref DBSubnetGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-DBSubnetGroupName"

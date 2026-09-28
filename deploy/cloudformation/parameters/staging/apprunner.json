@@ -1,0 +1,21 @@
+[
+  { "ParameterKey": "Environment",              "ParameterValue": "staging" },
+  { "ParameterKey": "ECRImageUri",              "ParameterValue": "ACCOUNT_ID.dkr.ecr.ap-southeast-2.amazonaws.com/bookworm/api:release-REPLACE" },
+  { "ParameterKey": "AppRunnerAccessRoleArn",   "ParameterValue": "arn:aws:iam::ACCOUNT_ID:role/bookworm-apprunner-access-role-staging" },
+  { "ParameterKey": "AppRunnerInstanceRoleArn", "ParameterValue": "arn:aws:iam::ACCOUNT_ID:role/bookworm-apprunner-instance-role-staging" },
+  { "ParameterKey": "VpcId",                    "ParameterValue": "vpc-REPLACE" },
+  { "ParameterKey": "PrivateSubnet1Id",          "ParameterValue": "subnet-REPLACE-1a" },
+  { "ParameterKey": "PrivateSubnet2Id",          "ParameterValue": "subnet-REPLACE-1b" },
+  { "ParameterKey": "RDSSecurityGroupId",        "ParameterValue": "sg-REPLACE" },
+  { "ParameterKey": "SecretDBPrimaryArn",        "ParameterValue": "arn:aws:secretsmanager:ap-southeast-2:ACCOUNT_ID:secret:bookworm/staging/db/primary-REPLACE" },
+  { "ParameterKey": "SecretDBReplicaArn",        "ParameterValue": "" },
+  { "ParameterKey": "SecretJWTArn",              "ParameterValue": "arn:aws:secretsmanager:ap-southeast-2:ACCOUNT_ID:secret:bookworm/staging/jwt-REPLACE" },
+  { "ParameterKey": "SecretPaymentArn",          "ParameterValue": "arn:aws:secretsmanager:ap-southeast-2:ACCOUNT_ID:secret:bookworm/staging/payment-REPLACE" },
+  { "ParameterKey": "SecretMailArn",             "ParameterValue": "arn:aws:secretsmanager:ap-southeast-2:ACCOUNT_ID:secret:bookworm/staging/mail-REPLACE" },
+  { "ParameterKey": "Cpu",                       "ParameterValue": "0.5 vCPU" },
+  { "ParameterKey": "Memory",                    "ParameterValue": "1 GB" },
+  { "ParameterKey": "AutoScalingMinSize",        "ParameterValue": "0" },
+  { "ParameterKey": "AutoScalingMaxSize",        "ParameterValue": "3" },
+  { "ParameterKey": "AutoScalingConcurrency",    "ParameterValue": "100" },
+  { "ParameterKey": "EnableObservabilityConfig", "ParameterValue": "true" }
+]

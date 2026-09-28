@@ -1,0 +1,388 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  BookWorm API — AWS App Runner Service with VPC Connector and Security Groups.
+  Creates the App Runner service sourced from a private ECR repository.
+  A VPC connector routes outbound traffic (RDS JDBC, Secrets Manager, X-Ray,
+  CloudWatch Logs, ECR) through private subnets without traversing the internet.
+  All secrets are injected as ARN references — plaintext values never appear in
+  the service configuration.
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Parameters
+# ──────────────────────────────────────────────────────────────────────────────
+Parameters:
+  Environment:
+    Type: String
+    AllowedValues: [dev, staging, prod]
+    Description: Deployment environment.
+
+  # ── Image source ────────────────────────────────────────────────────────────
+  ECRImageUri:
+    Type: String
+    Description: >
+      Full ECR image URI including tag or digest.
+      Example: 123456789012.dkr.ecr.ap-southeast-2.amazonaws.com/bookworm/api:release-1.0.0
+      Use a specific tag (not :latest) in production to guarantee reproducible deploys.
+
+  AppRunnerAccessRoleArn:
+    Type: String
+    Description: >
+      ARN of the App Runner access role (from iam stack output
+      AppRunnerAccessRoleArn).  Required to pull images from a private ECR repo.
+
+  AppRunnerInstanceRoleArn:
+    Type: String
+    Description: >
+      ARN of the App Runner instance role (from iam stack output
+      AppRunnerInstanceRoleArn).  Grants runtime permissions to the container.
+
+  # ── Networking ──────────────────────────────────────────────────────────────
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC containing the private subnets.
+
+  PrivateSubnet1Id:
+    Type: AWS::EC2::Subnet::Id
+    Description: Private subnet (AZ-a) for the VPC connector.
+
+  PrivateSubnet2Id:
+    Type: AWS::EC2::Subnet::Id
+    Description: Private subnet (AZ-b) for the VPC connector.
+
+  RDSSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: >
+      Security group ID attached to the RDS instances (from rds stack output
+      RDSSecurityGroupId).  The App Runner SG is added as an ingress source
+      on port 5432 of this group.
+
+  # ── Secrets ─────────────────────────────────────────────────────────────────
+  SecretDBPrimaryArn:
+    Type: String
+    Description: ARN of the primary DB credentials secret (from secrets stack).
+
+  SecretDBReplicaArn:
+    Type: String
+    Default: ""
+    Description: >
+      ARN of the read-replica DB credentials secret.  Leave blank if no replica
+      was provisioned.
+
+  SecretJWTArn:
+    Type: String
+    Description: ARN of the JWT signing secret (from secrets stack).
+
+  SecretPaymentArn:
+    Type: String
+    Description: ARN of the payment gateway secret (from secrets stack).
+
+  SecretMailArn:
+    Type: String
+    Description: ARN of the SMTP mail secret (from secrets stack).
+
+  # ── Compute sizing ──────────────────────────────────────────────────────────
+  Cpu:
+    Type: String
+    Default: "1 vCPU"
+    AllowedValues:
+      - "0.25 vCPU"
+      - "0.5 vCPU"
+      - "1 vCPU"
+      - "2 vCPU"
+      - "4 vCPU"
+    Description: vCPU allocation per instance.
+
+  Memory:
+    Type: String
+    Default: "2 GB"
+    AllowedValues:
+      - "0.5 GB"
+      - "1 GB"
+      - "2 GB"
+      - "3 GB"
+      - "4 GB"
+      - "6 GB"
+      - "8 GB"
+    Description: Memory allocation per instance.
+
+  # ── Auto-scaling ─────────────────────────────────────────────────────────────
+  AutoScalingMinSize:
+    Type: Number
+    Default: 1
+    MinValue: 0
+    Description: >
+      Minimum number of running instances.  Use 0 (pause) in non-production
+      environments to eliminate idle compute cost.
+
+  AutoScalingMaxSize:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    Description: Maximum number of running instances.
+
+  AutoScalingConcurrency:
+    Type: Number
+    Default: 100
+    MinValue: 1
+    MaxValue: 200
+    Description: Maximum concurrent requests per instance before scale-out triggers.
+
+  # ── Observability ─────────────────────────────────────────────────────────
+  EnableObservabilityConfig:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Enable App Runner CloudWatch and X-Ray observability integration.
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Conditions
+# ──────────────────────────────────────────────────────────────────────────────
+Conditions:
+  HasReplicaSecret: !Not [!Equals [!Ref SecretDBReplicaArn, ""]]
+  EnableObservability: !Equals [!Ref EnableObservabilityConfig, "true"]
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Resources
+# ──────────────────────────────────────────────────────────────────────────────
+Resources:
+
+  # ===========================================================================
+  # Security Group — App Runner VPC connector outbound rules
+  # App Runner manages all inbound traffic at the platform level; this SG only
+  # governs outbound egress from the VPC connector to private resources.
+  # ===========================================================================
+  AppRunnerVPCConnectorSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "BookWorm App Runner VPC connector egress — ${Environment}"
+      VpcId: !Ref VpcId
+      # Outbound: PostgreSQL primary and replica
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          DestinationSecurityGroupId: !Ref RDSSecurityGroupId
+          Description: PostgreSQL to RDS instances
+        # Outbound: HTTPS to VPC endpoints (Secrets Manager, X-Ray, CloudWatch, ECR)
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS to VPC Interface Endpoints
+        # Outbound: X-Ray daemon UDP (VPC endpoint)
+        - IpProtocol: udp
+          FromPort: 2000
+          ToPort: 2000
+          CidrIp: 0.0.0.0/0
+          Description: X-Ray daemon via VPC endpoint
+      Tags:
+        - Key: Name
+          Value: !Sub "sg-bookworm-apprunner-${Environment}"
+        - Key: Application
+          Value: bookworm-api
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # Allow RDS security group to receive from App Runner SG on port 5432.
+  # Defined as a separate resource to break the circular SG reference.
+  RDSIngressFromAppRunner:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref RDSSecurityGroupId
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      SourceSecurityGroupId: !Ref AppRunnerVPCConnectorSG
+      Description: Allow App Runner VPC connector to reach PostgreSQL
+
+  # ===========================================================================
+  # VPC Connector
+  # Attaches App Runner to the private subnets so it can reach RDS and
+  # Interface VPC Endpoints without traversing the public internet.
+  # ===========================================================================
+  VPCConnector:
+    Type: AWS::AppRunner::VpcConnector
+    Properties:
+      VpcConnectorName: !Sub "bookworm-apprunner-connector-${Environment}"
+      Subnets:
+        - !Ref PrivateSubnet1Id
+        - !Ref PrivateSubnet2Id
+      SecurityGroups:
+        - !Ref AppRunnerVPCConnectorSG
+      Tags:
+        - Key: Application
+          Value: bookworm-api
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ===========================================================================
+  # Auto Scaling Configuration
+  # Extracted as a separate resource so it can be shared across blue/green
+  # service revisions without re-creating the service.
+  # ===========================================================================
+  AutoScalingConfig:
+    Type: AWS::AppRunner::AutoScalingConfiguration
+    Properties:
+      AutoScalingConfigurationName: !Sub "bookworm-autoscaling-${Environment}"
+      MinSize: !Ref AutoScalingMinSize
+      MaxSize: !Ref AutoScalingMaxSize
+      MaxConcurrency: !Ref AutoScalingConcurrency
+      Tags:
+        - Key: Application
+          Value: bookworm-api
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ===========================================================================
+  # App Runner Observability Configuration
+  # Enables X-Ray tracing and CloudWatch metrics for the service.
+  # ===========================================================================
+  ObservabilityConfig:
+    Type: AWS::AppRunner::ObservabilityConfiguration
+    Condition: EnableObservability
+    Properties:
+      ObservabilityConfigurationName: !Sub "bookworm-observability-${Environment}"
+      TraceConfiguration:
+        Vendor: AWSXRAY
+      Tags:
+        - Key: Application
+          Value: bookworm-api
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ===========================================================================
+  # App Runner Service
+  # Source: private ECR repository.
+  # Secrets are referenced by ARN (not plaintext) — values are resolved at
+  # instance startup and injected as environment variables by App Runner.
+  # The application reads them via spring-cloud-aws-secrets-manager.
+  # ===========================================================================
+  AppRunnerService:
+    Type: AWS::AppRunner::Service
+    DependsOn:
+      - VPCConnector
+      - AutoScalingConfig
+    Properties:
+      ServiceName: !Sub "bookworm-api-${Environment}"
+
+      # ── Image source from private ECR ────────────────────────────────────
+      SourceConfiguration:
+        AuthenticationConfiguration:
+          AccessRoleArn: !Ref AppRunnerAccessRoleArn
+        AutoDeploymentsEnabled: true   # Auto-deploy on ECR image push
+        ImageRepository:
+          ImageIdentifier: !Ref ECRImageUri
+          ImageRepositoryType: ECR
+          ImageConfiguration:
+            Port: "8080"
+            RuntimeEnvironmentVariables:
+              # Spring profile controls application.yml selection
+              - Name: SPRING_PROFILES_ACTIVE
+                Value: !Ref Environment
+              # Explicit server port (defensive; matches application.yml default)
+              - Name: SERVER_PORT
+                Value: "8080"
+              # JVM flags: honour cgroup memory limits and exit cleanly on OOM
+              - Name: JAVA_OPTS
+                Value: "-XX:+UseContainerSupport -XX:MaxRAMPercentage=75.0 -XX:+ExitOnOutOfMemoryError"
+            RuntimeEnvironmentSecrets:
+              # Secrets Manager ARN → env-var injection at startup.
+              # Variable names are consumed by spring-cloud-aws-secrets-manager.
+              - Name: SPRING_DATASOURCE_URL_PRIMARY
+                Value: !Ref SecretDBPrimaryArn
+              - !If
+                - HasReplicaSecret
+                - Name: SPRING_DATASOURCE_URL_REPLICA
+                  Value: !Ref SecretDBReplicaArn
+                - !Ref AWS::NoValue
+              - Name: JWT_SECRET_CONFIG
+                Value: !Ref SecretJWTArn
+              - Name: PAYMENT_CONFIG
+                Value: !Ref SecretPaymentArn
+              - Name: MAIL_CONFIG
+                Value: !Ref SecretMailArn
+
+      # ── Instance configuration ───────────────────────────────────────────
+      InstanceConfiguration:
+        Cpu: !Ref Cpu
+        Memory: !Ref Memory
+        InstanceRoleArn: !Ref AppRunnerInstanceRoleArn
+
+      # ── Health check ─────────────────────────────────────────────────────
+      # Spring Boot Actuator health endpoint — returns 200 when all indicators UP
+      HealthCheckConfiguration:
+        Protocol: HTTP
+        Path: /v1/actuator/health
+        Interval: 10          # Seconds between checks
+        Timeout: 5            # Seconds before a check is considered failed
+        HealthyThreshold: 1   # Consecutive successes to mark healthy
+        UnhealthyThreshold: 5 # Consecutive failures before marking unhealthy
+
+      # ── Network — private VPC egress ─────────────────────────────────────
+      NetworkConfiguration:
+        EgressConfiguration:
+          EgressType: VPC
+          VpcConnectorArn: !GetAtt VPCConnector.VpcConnectorArn
+        IngressConfiguration:
+          IsPubliclyAccessible: true   # HTTPS termination handled by App Runner
+
+      # ── Auto-scaling ─────────────────────────────────────────────────────
+      AutoScalingConfigurationArn: !GetAtt AutoScalingConfig.AutoScalingConfigurationArn
+
+      # ── Observability (X-Ray + CloudWatch) ───────────────────────────────
+      ObservabilityConfiguration: !If
+        - EnableObservability
+        - ObservabilityConfigurationArn: !GetAtt ObservabilityConfig.ObservabilityConfigurationArn
+        - !Ref AWS::NoValue
+
+      Tags:
+        - Key: Application
+          Value: bookworm-api
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Outputs
+# ──────────────────────────────────────────────────────────────────────────────
+Outputs:
+  AppRunnerServiceUrl:
+    Description: Public HTTPS URL for the App Runner service
+    Value: !Sub "https://${AppRunnerService.ServiceUrl}"
+    Export:
+      Name: !Sub "${AWS::StackName}-ServiceUrl"
+
+  AppRunnerServiceArn:
+    Description: >
+      ARN of the App Runner service — supply to iam stack parameter
+      AppRunnerServiceArn to scope the CI/CD role's UpdateService permission.
+    Value: !GetAtt AppRunnerService.ServiceArn
+    Export:
+      Name: !Sub "${AWS::StackName}-ServiceArn"
+
+  AppRunnerServiceId:
+    Description: Unique App Runner service ID (useful for CLI operations)
+    Value: !GetAtt AppRunnerService.ServiceId
+    Export:
+      Name: !Sub "${AWS::StackName}-ServiceId"
+
+  VPCConnectorArn:
+    Description: ARN of the VPC connector
+    Value: !GetAtt VPCConnector.VpcConnectorArn
+    Export:
+      Name: !Sub "${AWS::StackName}-VPCConnectorArn"
+
+  AppRunnerSGId:
+    Description: Security group ID of the App Runner VPC connector
+    Value: !Ref AppRunnerVPCConnectorSG
+    Export:
+      Name: !Sub "${AWS::StackName}-AppRunnerSGId"

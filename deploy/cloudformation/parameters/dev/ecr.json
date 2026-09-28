@@ -1,0 +1,4 @@
+[
+  { "ParameterKey": "Environment",                   "ParameterValue": "dev" },
+  { "ParameterKey": "RepositoryName",                "ParameterValue": "bookworm/api" }
+]

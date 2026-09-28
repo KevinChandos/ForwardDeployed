@@ -1,0 +1,58 @@
+# ============================================================
+# app-runner/production.json
+# Purpose: AWS App Runner service configuration for production.
+# Usage: Used when provisioning or updating the App Runner
+#        service via the AWS CLI or IaC tooling.
+# Side effect: Modifying CPU/memory triggers an App Runner
+#              service update and brief traffic pause.
+# ============================================================
+{
+  "ServiceName": "my-app-prod",
+  "SourceConfiguration": {
+    "ImageRepository": {
+      "ImageIdentifier": "123456789012.dkr.ecr.ap-southeast-1.amazonaws.com/my-app:latest-prod",
+      "ImageConfiguration": {
+        "Port": "8080",
+        "RuntimeEnvironmentVariables": {
+          "APP_ENV": "production",
+          "LOG_LEVEL": "WARN",
+          "LOG_FORMAT": "json",
+          "SERVER_PORT": "8080"
+        }
+      },
+      "ImageRepositoryType": "ECR"
+    },
+    "AutoDeploymentsEnabled": false,
+    "AuthenticationConfiguration": {
+      "AccessRoleArn": "arn:aws:iam::123456789012:role/AppRunnerECRAccessRole"
+    }
+  },
+  "InstanceConfiguration": {
+    "Cpu": "1 vCPU",
+    "Memory": "2 GB",
+    "InstanceRoleArn": "arn:aws:iam::123456789012:role/AppRunnerInstanceRole"
+  },
+  "AutoScalingConfigurationArn": "arn:aws:apprunner:ap-southeast-1:123456789012:autoscalingconfiguration/my-app-prod-asc",
+  "HealthCheckConfiguration": {
+    "Protocol": "HTTP",
+    "Path": "/actuator/health",
+    "Interval": 10,
+    "Timeout": 5,
+    "HealthyThreshold": 1,
+    "UnhealthyThreshold": 3
+  },
+  "NetworkConfiguration": {
+    "EgressConfiguration": {
+      "EgressType": "VPC",
+      "VpcConnectorArn": "arn:aws:apprunner:ap-southeast-1:123456789012:vpcconnector/my-vpc-connector/1/xxxxxxxx"
+    },
+    "IngressConfiguration": {
+      "IsPubliclyAccessible": true
+    }
+  },
+  "Tags": [
+    { "Key": "Environment", "Value": "production" },
+    { "Key": "ManagedBy",   "Value": "github-actions" },
+    { "Key": "Project",     "Value": "my-app" }
+  ]
+}

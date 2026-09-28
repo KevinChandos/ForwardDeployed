@@ -1,0 +1,52 @@
+# ============================================================
+# app-runner/staging.json
+# Purpose: AWS App Runner service configuration for staging.
+# Usage: Used when provisioning or updating the staging App
+#        Runner service via the AWS CLI or IaC tooling.
+# Side effect: Staging uses lower CPU/memory to reduce costs.
+# ============================================================
+{
+  "ServiceName": "my-app-staging",
+  "SourceConfiguration": {
+    "ImageRepository": {
+      "ImageIdentifier": "123456789012.dkr.ecr.ap-southeast-1.amazonaws.com/my-app:latest-staging",
+      "ImageConfiguration": {
+        "Port": "8080",
+        "RuntimeEnvironmentVariables": {
+          "APP_ENV": "staging",
+          "LOG_LEVEL": "INFO",
+          "LOG_FORMAT": "json",
+          "SERVER_PORT": "8080"
+        }
+      },
+      "ImageRepositoryType": "ECR"
+    },
+    "AutoDeploymentsEnabled": false,
+    "AuthenticationConfiguration": {
+      "AccessRoleArn": "arn:aws:iam::123456789012:role/AppRunnerECRAccessRole"
+    }
+  },
+  "InstanceConfiguration": {
+    "Cpu": "0.25 vCPU",
+    "Memory": "0.5 GB",
+    "InstanceRoleArn": "arn:aws:iam::123456789012:role/AppRunnerInstanceRole"
+  },
+  "HealthCheckConfiguration": {
+    "Protocol": "HTTP",
+    "Path": "/actuator/health",
+    "Interval": 10,
+    "Timeout": 5,
+    "HealthyThreshold": 1,
+    "UnhealthyThreshold": 3
+  },
+  "NetworkConfiguration": {
+    "IngressConfiguration": {
+      "IsPubliclyAccessible": true
+    }
+  },
+  "Tags": [
+    { "Key": "Environment", "Value": "staging" },
+    { "Key": "ManagedBy",   "Value": "github-actions" },
+    { "Key": "Project",     "Value": "my-app" }
+  ]
+}

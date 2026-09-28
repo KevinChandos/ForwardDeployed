@@ -1,0 +1,59 @@
+# Integration test profile — overrides only what differs from application.yml.
+# Why: keeps the integration test context identical to production as much as possible;
+# only datasource URL, DDL validation mode, and logging verbosity are changed here.
+# The actual datasource URL/credentials are injected at runtime via @DynamicPropertySource
+# (Testcontainer) and override whatever is set below — these values act as fallbacks only.
+
+spring:
+  application:
+    name: bookworm-api-integration-test
+
+  datasource:
+    # Overridden at runtime by AbstractIntegrationTest@DynamicPropertySource
+    url: jdbc:postgresql://localhost:5432/bookworm_it
+    username: it_user
+    password: it_pass
+    driver-class-name: org.postgresql.Driver
+    hikari:
+      maximum-pool-size: 5          # Smaller pool keeps test resource usage low
+
+  jpa:
+    hibernate:
+      # Why: validate — Flyway owns the schema; Hibernate must not attempt to alter it.
+      ddl-auto: validate
+    show-sql: false
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.PostgreSQLDialect
+        format_sql: false            # Suppress verbose SQL in CI logs
+        jdbc:
+          time_zone: UTC
+        default_schema: public
+
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+    baseline-on-migrate: false
+    # Why: clean-disabled prevents accidental schema wipe on a shared DB.
+    clean-disabled: true
+
+  security:
+    jwt:
+      # Why: a fixed 64-char test secret avoids padding issues in JwtProvider
+      # and is distinct from any value that could leak from production configs.
+      secret: "INTEGRATION_TEST_SECRET_KEY_FOR_TESTS_ONLY_NOT_FOR_PROD_1234567890"
+      access-token-ttl-seconds: 3600    # 1 hour — long enough to survive a full test suite run
+      refresh-token-ttl-seconds: 86400
+
+server:
+  servlet:
+    context-path: /v1
+
+# Why: suppress Spring Security debug output; keep test output readable.
+logging:
+  level:
+    io.bookworm: WARN
+    org.springframework.security: WARN
+    org.hibernate.SQL: WARN
+    org.testcontainers: INFO
+    com.zaxxer.hikari: WARN

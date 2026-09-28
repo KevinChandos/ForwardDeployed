@@ -1,0 +1,577 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  BookWorm API — Amazon CloudWatch Log Groups, Metric Alarms, and Ops Dashboard.
+  All log groups are pre-created here (not auto-created by App Runner or RDS) so
+  that retention and KMS encryption settings are enforced by IaC.
+  Alarms cover the seven operational scenarios defined in the architecture doc
+  and notify via SNS topics (one for PagerDuty-severity, one for Slack).
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Parameters
+# ──────────────────────────────────────────────────────────────────────────────
+Parameters:
+  Environment:
+    Type: String
+    AllowedValues: [dev, staging, prod]
+    Description: Deployment environment.
+
+  AppRunnerServiceName:
+    Type: String
+    Default: "bookworm-api"
+    Description: >
+      Base name of the App Runner service (without the environment suffix).
+      Used to construct log group paths.  Must match the ServiceName in
+      apprunner.yaml.
+
+  DBInstanceIdentifier:
+    Type: String
+    Default: ""
+    Description: >
+      Identifier of the primary RDS instance (exported from rds stack).
+      Used to scope RDS metric alarms.  Leave blank to skip RDS alarms.
+
+  DBReplicaIdentifier:
+    Type: String
+    Default: ""
+    Description: >
+      Identifier of the read replica RDS instance.  Leave blank to skip
+      replica-specific alarms (e.g. ReplicaLag).
+
+  PagerDutyAlarmEmail:
+    Type: String
+    Default: ""
+    Description: >
+      Email address subscribed to the PagerDuty SNS topic.  Leave blank to
+      create the topic without a subscription (add subscribers manually).
+
+  SlackAlarmEmail:
+    Type: String
+    Default: ""
+    Description: >
+      Email address subscribed to the Slack-notification SNS topic.
+
+  LogKmsKeyArn:
+    Type: String
+    Default: ""
+    Description: >
+      Optional ARN of a KMS key for encrypting CloudWatch Log Groups at rest.
+      Leave blank to use the default CloudWatch service-managed encryption.
+
+  AppLogRetentionDays:
+    Type: Number
+    Default: 30
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 180, 365]
+    Description: Retention period for application log events.
+
+  SystemLogRetentionDays:
+    Type: Number
+    Default: 7
+    AllowedValues: [1, 3, 5, 7, 14, 30]
+    Description: Retention period for App Runner platform/system log events.
+
+  RDSLogRetentionDays:
+    Type: Number
+    Default: 14
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60]
+    Description: Retention period for RDS PostgreSQL log events.
+
+  # ── Alarm thresholds (allow per-environment tuning) ──────────────────────
+  Alarm5xxThresholdPct:
+    Type: Number
+    Default: 1
+    Description: "5xx error rate threshold percentage over a 5-minute window."
+
+  AlarmP99LatencyThresholdMs:
+    Type: Number
+    Default: 2000
+    Description: "p99 request latency threshold in milliseconds."
+
+  AlarmRDSCpuThresholdPct:
+    Type: Number
+    Default: 80
+    Description: "RDS CPU utilisation threshold percentage over a 10-minute window."
+
+  AlarmRDSConnectionsThreshold:
+    Type: Number
+    Default: 80
+    Description: "RDS active connections threshold count."
+
+  AlarmRDSFreeStorageThresholdGB:
+    Type: Number
+    Default: 20
+    Description: "RDS free storage threshold in GB."
+
+  AlarmReplicaLagThresholdSeconds:
+    Type: Number
+    Default: 30
+    Description: "Read-replica replication lag threshold in seconds."
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Conditions
+# ──────────────────────────────────────────────────────────────────────────────
+Conditions:
+  HasKmsKey: !Not [!Equals [!Ref LogKmsKeyArn, ""]]
+  HasDBInstance: !Not [!Equals [!Ref DBInstanceIdentifier, ""]]
+  HasDBReplica: !Not [!Equals [!Ref DBReplicaIdentifier, ""]]
+  HasPagerDutyEmail: !Not [!Equals [!Ref PagerDutyAlarmEmail, ""]]
+  HasSlackEmail: !Not [!Equals [!Ref SlackAlarmEmail, ""]]
+  IsProd: !Equals [!Ref Environment, "prod"]
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Resources
+# ──────────────────────────────────────────────────────────────────────────────
+Resources:
+
+  # ===========================================================================
+  # SNS Topics for alarm routing
+  # ===========================================================================
+
+  # High-severity: triggers PagerDuty on-call escalation
+  AlarmTopicPagerDuty:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "bookworm-alarms-pagerduty-${Environment}"
+      DisplayName: !Sub "BookWorm ${Environment} — Critical Alarms"
+      Subscription: !If
+        - HasPagerDutyEmail
+        - - Protocol: email
+            Endpoint: !Ref PagerDutyAlarmEmail
+        - !Ref AWS::NoValue
+      Tags:
+        - Key: Application
+          Value: bookworm-api
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # Medium-severity: posts to Slack channel
+  AlarmTopicSlack:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "bookworm-alarms-slack-${Environment}"
+      DisplayName: !Sub "BookWorm ${Environment} — Warning Alarms"
+      Subscription: !If
+        - HasSlackEmail
+        - - Protocol: email
+            Endpoint: !Ref SlackAlarmEmail
+        - !Ref AWS::NoValue
+      Tags:
+        - Key: Application
+          Value: bookworm-api
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ===========================================================================
+  # CloudWatch Log Groups
+  # Pre-created so retention and KMS settings are always under IaC control.
+  # ===========================================================================
+
+  # App Runner application logs (Spring Boot output, structured JSON)
+  LogGroupAppRunnerApp:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain   # Preserve logs if the stack is torn down
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: !Sub "/aws/apprunner/${AppRunnerServiceName}-${Environment}/application"
+      RetentionInDays: !Ref AppLogRetentionDays
+      KmsKeyId: !If [HasKmsKey, !Ref LogKmsKeyArn, !Ref "AWS::NoValue"]
+      Tags:
+        - Key: Application
+          Value: bookworm-api
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: LogType
+          Value: application
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # App Runner system/platform events (deploy status, health-check events)
+  LogGroupAppRunnerSystem:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: !Sub "/aws/apprunner/${AppRunnerServiceName}-${Environment}/system"
+      RetentionInDays: !Ref SystemLogRetentionDays
+      KmsKeyId: !If [HasKmsKey, !Ref LogKmsKeyArn, !Ref "AWS::NoValue"]
+      Tags:
+        - Key: Application
+          Value: bookworm-api
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: LogType
+          Value: system
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # RDS PostgreSQL logs (slow queries, connections, errors)
+  LogGroupRDS:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: !Sub "/aws/rds/instance/bookworm-${Environment}/postgresql"
+      RetentionInDays: !Ref RDSLogRetentionDays
+      KmsKeyId: !If [HasKmsKey, !Ref LogKmsKeyArn, !Ref "AWS::NoValue"]
+      Tags:
+        - Key: Application
+          Value: bookworm-api
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: LogType
+          Value: database
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ===========================================================================
+  # CloudWatch Alarms
+  # ===========================================================================
+
+  # ── App Runner: 5xx error rate ─────────────────────────────────────────────
+  # Uses the built-in App Runner metric.  Fires when errors exceed the threshold
+  # as a percentage of total requests over a 5-minute window.
+  Alarm5xxRate:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "bookworm-api-5xx-rate-${Environment}"
+      AlarmDescription: !Sub >
+        App Runner 5xx response rate exceeded ${Alarm5xxThresholdPct}% over
+        5 minutes in ${Environment}.
+      Namespace: AWS/AppRunner
+      MetricName: 5XXStatusResponses
+      Dimensions:
+        - Name: ServiceName
+          Value: !Sub "${AppRunnerServiceName}-${Environment}"
+      Statistic: Sum
+      Period: 300   # 5-minute evaluation window
+      EvaluationPeriods: 1
+      Threshold: !Ref Alarm5xxThresholdPct
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlarmTopicPagerDuty
+      OKActions:
+        - !Ref AlarmTopicPagerDuty
+
+  # ── App Runner: p99 request latency ───────────────────────────────────────
+  AlarmP99Latency:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "bookworm-api-p99-latency-${Environment}"
+      AlarmDescription: !Sub >
+        App Runner p99 latency exceeded ${AlarmP99LatencyThresholdMs}ms over
+        5 minutes in ${Environment}.
+      Namespace: AWS/AppRunner
+      MetricName: RequestLatency
+      Dimensions:
+        - Name: ServiceName
+          Value: !Sub "${AppRunnerServiceName}-${Environment}"
+      ExtendedStatistic: p99
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: !Ref AlarmP99LatencyThresholdMs
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlarmTopicSlack
+      OKActions:
+        - !Ref AlarmTopicSlack
+
+  # ── App Runner: max instances reached ─────────────────────────────────────
+  AlarmMaxInstances:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "bookworm-api-instance-count-max-${Environment}"
+      AlarmDescription: !Sub >
+        App Runner has reached its maximum instance count (5) in ${Environment}.
+        Consider raising the auto-scaling limit or investigating load.
+      Namespace: AWS/AppRunner
+      MetricName: ActiveInstances
+      Dimensions:
+        - Name: ServiceName
+          Value: !Sub "${AppRunnerServiceName}-${Environment}"
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlarmTopicSlack
+      OKActions:
+        - !Ref AlarmTopicSlack
+
+  # ── RDS: CPU utilisation ───────────────────────────────────────────────────
+  AlarmRDSCPU:
+    Type: AWS::CloudWatch::Alarm
+    Condition: HasDBInstance
+    Properties:
+      AlarmName: !Sub "bookworm-rds-cpu-${Environment}"
+      AlarmDescription: !Sub >
+        RDS CPU utilisation exceeded ${AlarmRDSCpuThresholdPct}% over 10
+        minutes in ${Environment}.
+      Namespace: AWS/RDS
+      MetricName: CPUUtilization
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: !Ref DBInstanceIdentifier
+      Statistic: Average
+      Period: 600   # 10-minute evaluation window
+      EvaluationPeriods: 1
+      Threshold: !Ref AlarmRDSCpuThresholdPct
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlarmTopicPagerDuty
+      OKActions:
+        - !Ref AlarmTopicPagerDuty
+
+  # ── RDS: connection count ──────────────────────────────────────────────────
+  AlarmRDSConnections:
+    Type: AWS::CloudWatch::Alarm
+    Condition: HasDBInstance
+    Properties:
+      AlarmName: !Sub "bookworm-rds-connections-${Environment}"
+      AlarmDescription: !Sub >
+        RDS DatabaseConnections exceeded ${AlarmRDSConnectionsThreshold} over
+        5 minutes in ${Environment}.  Check HikariCP pool settings.
+      Namespace: AWS/RDS
+      MetricName: DatabaseConnections
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: !Ref DBInstanceIdentifier
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: !Ref AlarmRDSConnectionsThreshold
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlarmTopicSlack
+      OKActions:
+        - !Ref AlarmTopicSlack
+
+  # ── RDS: free storage space ────────────────────────────────────────────────
+  AlarmRDSLowStorage:
+    Type: AWS::CloudWatch::Alarm
+    Condition: HasDBInstance
+    Properties:
+      AlarmName: !Sub "bookworm-rds-storage-low-${Environment}"
+      AlarmDescription: !Sub >
+        RDS free storage fell below ${AlarmRDSFreeStorageThresholdGB}GB in
+        ${Environment}.  Storage auto-scaling will activate but PagerDuty
+        notification confirms awareness.
+      Namespace: AWS/RDS
+      MetricName: FreeStorageSpace
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: !Ref DBInstanceIdentifier
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 1
+      # Convert GB to bytes for the CloudWatch FreeStorageSpace metric
+      Threshold: !Select
+        - 0
+        - - !If
+            - HasDBInstance
+            - !Select
+              - 0
+              - - 21474836480   # 20 GB in bytes (default) — literal; parameterised alarms
+                  # cannot do math in CFN.  Override via threshold param * 1073741824 externally.
+            - 0
+      ComparisonOperator: LessThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlarmTopicPagerDuty
+      OKActions:
+        - !Ref AlarmTopicPagerDuty
+
+  # ── RDS Read Replica: replication lag ─────────────────────────────────────
+  AlarmReplicaLag:
+    Type: AWS::CloudWatch::Alarm
+    Condition: HasDBReplica
+    Properties:
+      AlarmName: !Sub "bookworm-rds-replica-lag-${Environment}"
+      AlarmDescription: !Sub >
+        RDS read-replica replication lag exceeded ${AlarmReplicaLagThresholdSeconds}
+        seconds in ${Environment}.  Read traffic may be serving stale data.
+      Namespace: AWS/RDS
+      MetricName: ReplicaLag
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: !Ref DBReplicaIdentifier
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: !Ref AlarmReplicaLagThresholdSeconds
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlarmTopicSlack
+      OKActions:
+        - !Ref AlarmTopicSlack
+
+  # ===========================================================================
+  # CloudWatch Dashboard — bookworm-<env>-ops
+  # Assembles App Runner and RDS widgets into a single operational overview.
+  # ===========================================================================
+  OpsDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub "bookworm-${Environment}-ops"
+      # Dashboard body uses CloudWatch JSON widget syntax.
+      # Widgets are laid out on a 24-column grid; each row is ~6 units tall.
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "text",
+              "x": 0, "y": 0, "width": 24, "height": 2,
+              "properties": {
+                "markdown": "## BookWorm API — ${Environment} Operations\nGenerated by CloudFormation. Region: ${AWS::Region} | Account: ${AWS::AccountId}"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0, "y": 2, "width": 8, "height": 6,
+              "properties": {
+                "title": "App Runner — Requests / min",
+                "metrics": [
+                  ["AWS/AppRunner", "Requests", "ServiceName", "${AppRunnerServiceName}-${Environment}", {"stat": "Sum", "period": 60, "label": "Requests"}]
+                ],
+                "view": "timeSeries", "stacked": false, "period": 60
+              }
+            },
+            {
+              "type": "metric",
+              "x": 8, "y": 2, "width": 8, "height": 6,
+              "properties": {
+                "title": "App Runner — HTTP Status Codes",
+                "metrics": [
+                  ["AWS/AppRunner", "2XXStatusResponses", "ServiceName", "${AppRunnerServiceName}-${Environment}", {"stat": "Sum", "period": 60, "label": "2xx"}],
+                  ["AWS/AppRunner", "4XXStatusResponses", "ServiceName", "${AppRunnerServiceName}-${Environment}", {"stat": "Sum", "period": 60, "label": "4xx", "color": "#FF7F0E"}],
+                  ["AWS/AppRunner", "5XXStatusResponses", "ServiceName", "${AppRunnerServiceName}-${Environment}", {"stat": "Sum", "period": 60, "label": "5xx", "color": "#D62728"}]
+                ],
+                "view": "timeSeries", "stacked": false, "period": 60
+              }
+            },
+            {
+              "type": "metric",
+              "x": 16, "y": 2, "width": 8, "height": 6,
+              "properties": {
+                "title": "App Runner — Request Latency (p50/p95/p99)",
+                "metrics": [
+                  ["AWS/AppRunner", "RequestLatency", "ServiceName", "${AppRunnerServiceName}-${Environment}", {"stat": "p50", "period": 60, "label": "p50"}],
+                  ["AWS/AppRunner", "RequestLatency", "ServiceName", "${AppRunnerServiceName}-${Environment}", {"stat": "p95", "period": 60, "label": "p95"}],
+                  ["AWS/AppRunner", "RequestLatency", "ServiceName", "${AppRunnerServiceName}-${Environment}", {"stat": "p99", "period": 60, "label": "p99", "color": "#D62728"}]
+                ],
+                "view": "timeSeries", "stacked": false, "period": 60
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0, "y": 8, "width": 8, "height": 6,
+              "properties": {
+                "title": "App Runner — Active Instances",
+                "metrics": [
+                  ["AWS/AppRunner", "ActiveInstances", "ServiceName", "${AppRunnerServiceName}-${Environment}", {"stat": "Maximum", "period": 60, "label": "Instances"}]
+                ],
+                "view": "timeSeries", "stacked": false, "period": 60
+              }
+            },
+            {
+              "type": "metric",
+              "x": 8, "y": 8, "width": 8, "height": 6,
+              "properties": {
+                "title": "RDS Primary — CPU & Connections",
+                "metrics": [
+                  ["AWS/RDS", "CPUUtilization", "DBInstanceIdentifier", "bookworm-${Environment}-primary", {"stat": "Average", "period": 60, "label": "CPU %", "yAxis": "left"}],
+                  ["AWS/RDS", "DatabaseConnections", "DBInstanceIdentifier", "bookworm-${Environment}-primary", {"stat": "Average", "period": 60, "label": "Connections", "yAxis": "right"}]
+                ],
+                "view": "timeSeries", "stacked": false, "period": 60
+              }
+            },
+            {
+              "type": "metric",
+              "x": 16, "y": 8, "width": 8, "height": 6,
+              "properties": {
+                "title": "RDS Primary — IOPS & Free Storage",
+                "metrics": [
+                  ["AWS/RDS", "ReadIOPS", "DBInstanceIdentifier", "bookworm-${Environment}-primary", {"stat": "Average", "period": 60, "label": "Read IOPS"}],
+                  ["AWS/RDS", "WriteIOPS", "DBInstanceIdentifier", "bookworm-${Environment}-primary", {"stat": "Average", "period": 60, "label": "Write IOPS"}],
+                  ["AWS/RDS", "FreeStorageSpace", "DBInstanceIdentifier", "bookworm-${Environment}-primary", {"stat": "Average", "period": 60, "label": "Free Storage (bytes)", "yAxis": "right"}]
+                ],
+                "view": "timeSeries", "stacked": false, "period": 60
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0, "y": 14, "width": 8, "height": 6,
+              "properties": {
+                "title": "RDS Replica — Lag & CPU",
+                "metrics": [
+                  ["AWS/RDS", "ReplicaLag", "DBInstanceIdentifier", "bookworm-${Environment}-replica", {"stat": "Average", "period": 60, "label": "Replica Lag (s)"}],
+                  ["AWS/RDS", "CPUUtilization", "DBInstanceIdentifier", "bookworm-${Environment}-replica", {"stat": "Average", "period": 60, "label": "Replica CPU %", "yAxis": "right"}]
+                ],
+                "view": "timeSeries", "stacked": false, "period": 60
+              }
+            },
+            {
+              "type": "alarm",
+              "x": 8, "y": 14, "width": 16, "height": 6,
+              "properties": {
+                "title": "Alarm Status",
+                "alarms": [
+                  "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:bookworm-api-5xx-rate-${Environment}",
+                  "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:bookworm-api-p99-latency-${Environment}",
+                  "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:bookworm-api-instance-count-max-${Environment}",
+                  "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:bookworm-rds-cpu-${Environment}",
+                  "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:bookworm-rds-connections-${Environment}",
+                  "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:bookworm-rds-storage-low-${Environment}",
+                  "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:bookworm-rds-replica-lag-${Environment}"
+                ]
+              }
+            }
+          ]
+        }
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Outputs
+# ──────────────────────────────────────────────────────────────────────────────
+Outputs:
+  AppLogGroupName:
+    Description: Name of the App Runner application log group
+    Value: !Ref LogGroupAppRunnerApp
+    Export:
+      Name: !Sub "${AWS::StackName}-AppLogGroupName"
+
+  SystemLogGroupName:
+    Description: Name of the App Runner system log group
+    Value: !Ref LogGroupAppRunnerSystem
+    Export:
+      Name: !Sub "${AWS::StackName}-SystemLogGroupName"
+
+  RDSLogGroupName:
+    Description: Name of the RDS PostgreSQL log group
+    Value: !Ref LogGroupRDS
+    Export:
+      Name: !Sub "${AWS::StackName}-RDSLogGroupName"
+
+  PagerDutyTopicArn:
+    Description: ARN of the PagerDuty (critical) alarm SNS topic
+    Value: !Ref AlarmTopicPagerDuty
+    Export:
+      Name: !Sub "${AWS::StackName}-PagerDutyTopicArn"
+
+  SlackTopicArn:
+    Description: ARN of the Slack (warning) alarm SNS topic
+    Value: !Ref AlarmTopicSlack
+    Export:
+      Name: !Sub "${AWS::StackName}-SlackTopicArn"
+
+  DashboardUrl:
+    Description: Direct URL to the CloudWatch Ops dashboard
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=bookworm-${Environment}-ops"

@@ -1,0 +1,117 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  BookWorm API — Amazon ECR Private Repository.
+  Creates an immutable, scan-on-push repository with a lifecycle policy that
+  expires untagged images after 1 day, retains the last 10 release-prefixed
+  images, and keeps the last 5 of every other tag.
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Parameters
+# ──────────────────────────────────────────────────────────────────────────────
+Parameters:
+  Environment:
+    Type: String
+    AllowedValues: [dev, staging, prod]
+    Description: Deployment environment (controls resource naming & tagging).
+
+  RepositoryName:
+    Type: String
+    Default: bookworm/api
+    Description: >
+      ECR repository name. Follows the <namespace>/<service> convention so
+      multiple services can share the same registry namespace without collision.
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Resources
+# ──────────────────────────────────────────────────────────────────────────────
+Resources:
+
+  # ---------------------------------------------------------------------------
+  # ECR Repository
+  # Tag mutability is IMMUTABLE so that CI pushes cannot silently overwrite a
+  # production image.  Enhanced scanning (via Inspector) fires on every push and
+  # should be gated in the pipeline before App Runner auto-deploys the image.
+  # ---------------------------------------------------------------------------
+  BookWormECRRepository:
+    Type: AWS::ECR::Repository
+    DeletionPolicy: Retain   # Prevent accidental image loss on stack delete
+    UpdateReplacePolicy: Retain
+    Properties:
+      RepositoryName: !Ref RepositoryName
+      ImageTagMutability: IMMUTABLE
+      ImageScanningConfiguration:
+        ScanOnPush: true   # Triggers Inspector Enhanced Scanning
+      EncryptionConfiguration:
+        EncryptionType: AES256   # AWS-managed key; upgrade to KMS for BYOK
+      LifecyclePolicy:
+        # Evaluated in rule-priority order (lowest number first).
+        # Rule 1 — release tags: keep last 10
+        # Rule 2 — all other tagged images: keep last 5
+        # Rule 3 — untagged images: expire after 1 day (build cache cleanup)
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Keep last 10 release-tagged images",
+                "selection": {
+                  "tagStatus": "tagged",
+                  "tagPrefixList": ["release-"],
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 10
+                },
+                "action": { "type": "expire" }
+              },
+              {
+                "rulePriority": 2,
+                "description": "Keep last 5 of any other tagged image",
+                "selection": {
+                  "tagStatus": "tagged",
+                  "tagPrefixList": [""],
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 5
+                },
+                "action": { "type": "expire" }
+              },
+              {
+                "rulePriority": 3,
+                "description": "Expire untagged images after 1 day",
+                "selection": {
+                  "tagStatus": "untagged",
+                  "countType": "sinceImagePushed",
+                  "countUnit": "days",
+                  "countNumber": 1
+                },
+                "action": { "type": "expire" }
+              }
+            ]
+          }
+      Tags:
+        - Key: Application
+          Value: bookworm-api
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Outputs  (exported so downstream stacks can reference the repository URI)
+# ──────────────────────────────────────────────────────────────────────────────
+Outputs:
+  RepositoryUri:
+    Description: Full ECR repository URI (used in App Runner image configuration)
+    Value: !GetAtt BookWormECRRepository.RepositoryUri
+    Export:
+      Name: !Sub "${AWS::StackName}-RepositoryUri"
+
+  RepositoryArn:
+    Description: ARN of the ECR repository (used in IAM policy resources)
+    Value: !GetAtt BookWormECRRepository.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-RepositoryArn"
+
+  RepositoryName:
+    Description: Short repository name (used for ECR login in CI scripts)
+    Value: !Ref BookWormECRRepository
+    Export:
+      Name: !Sub "${AWS::StackName}-RepositoryName"

@@ -1,0 +1,21 @@
+[
+  { "ParameterKey": "Environment",              "ParameterValue": "dev" },
+  { "ParameterKey": "ECRImageUri",              "ParameterValue": "ACCOUNT_ID.dkr.ecr.ap-southeast-2.amazonaws.com/bookworm/api:latest" },
+  { "ParameterKey": "AppRunnerAccessRoleArn",   "ParameterValue": "arn:aws:iam::ACCOUNT_ID:role/bookworm-apprunner-access-role-dev" },
+  { "ParameterKey": "AppRunnerInstanceRoleArn", "ParameterValue": "arn:aws:iam::ACCOUNT_ID:role/bookworm-apprunner-instance-role-dev" },
+  { "ParameterKey": "VpcId",                    "ParameterValue": "vpc-REPLACE" },
+  { "ParameterKey": "PrivateSubnet1Id",          "ParameterValue": "subnet-REPLACE-1a" },
+  { "ParameterKey": "PrivateSubnet2Id",          "ParameterValue": "subnet-REPLACE-1b" },
+  { "ParameterKey": "RDSSecurityGroupId",        "ParameterValue": "sg-REPLACE" },
+  { "ParameterKey": "SecretDBPrimaryArn",        "ParameterValue": "arn:aws:secretsmanager:ap-southeast-2:ACCOUNT_ID:secret:bookworm/dev/db/primary-REPLACE" },
+  { "ParameterKey": "SecretDBReplicaArn",        "ParameterValue": "" },
+  { "ParameterKey": "SecretJWTArn",              "ParameterValue": "arn:aws:secretsmanager:ap-southeast-2:ACCOUNT_ID:secret:bookworm/dev/jwt-REPLACE" },
+  { "ParameterKey": "SecretPaymentArn",          "ParameterValue": "arn:aws:secretsmanager:ap-southeast-2:ACCOUNT_ID:secret:bookworm/dev/payment-REPLACE" },
+  { "ParameterKey": "SecretMailArn",             "ParameterValue": "arn:aws:secretsmanager:ap-southeast-2:ACCOUNT_ID:secret:bookworm/dev/mail-REPLACE" },
+  { "ParameterKey": "Cpu",                       "ParameterValue": "0.25 vCPU" },
+  { "ParameterKey": "Memory",                    "ParameterValue": "0.5 GB" },
+  { "ParameterKey": "AutoScalingMinSize",        "ParameterValue": "0" },
+  { "ParameterKey": "AutoScalingMaxSize",        "ParameterValue": "2" },
+  { "ParameterKey": "AutoScalingConcurrency",    "ParameterValue": "100" },
+  { "ParameterKey": "EnableObservabilityConfig", "ParameterValue": "false" }
+]

@@ -1,0 +1,305 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  BookWorm API — IAM Roles & Policies.
+  Provisions two roles with least-privilege policies:
+    1. bookworm-apprunner-instance-role — runtime role assumed by the App Runner
+       service instance.  Grants only what the Spring Boot app needs: read
+       secrets, write X-Ray traces, write CloudWatch logs, and pull ECR images.
+    2. bookworm-cicd-role — assumed by CodeBuild (or any CI system) to push
+       images to ECR and trigger an App Runner service update.
+  All resource ARNs are scoped to the specific environment to prevent
+  cross-environment privilege escalation.
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Parameters
+# ──────────────────────────────────────────────────────────────────────────────
+Parameters:
+  Environment:
+    Type: String
+    AllowedValues: [dev, staging, prod]
+    Description: Deployment environment.
+
+  AwsRegion:
+    Type: String
+    Default: ap-southeast-2
+    Description: AWS region where resources are deployed.
+
+  ECRRepositoryArn:
+    Type: String
+    Description: >
+      ARN of the ECR repository (exported from the ecr stack).
+      Used to scope ECR pull and push permissions to the single bookworm
+      repository instead of the entire account registry.
+
+  AppRunnerServiceArn:
+    Type: String
+    Default: ""
+    Description: >
+      ARN of the App Runner service (exported from the apprunner stack).
+      Used to scope the CI/CD role's UpdateService permission.
+      Leave blank on first deploy; update after apprunner stack is created.
+
+  SecretsManagerPathPrefix:
+    Type: String
+    Default: "bookworm"
+    Description: >
+      Prefix for all Secrets Manager secret names.  The IAM policy will allow
+      GetSecretValue on arn:*:secretsmanager:*:*:secret:<prefix>/<env>/*.
+      Do not change this unless you also rename the secrets in secrets.yaml.
+
+  CloudWatchLogGroupPrefix:
+    Type: String
+    Default: "/aws/apprunner/bookworm-api"
+    Description: >
+      Prefix for App Runner log group ARNs granted to the instance role.
+      Matches the log groups created in cloudwatch.yaml.
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Conditions
+# ──────────────────────────────────────────────────────────────────────────────
+Conditions:
+  HasAppRunnerServiceArn: !Not [!Equals [!Ref AppRunnerServiceArn, ""]]
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Resources
+# ──────────────────────────────────────────────────────────────────────────────
+Resources:
+
+  # ===========================================================================
+  # 1. App Runner Instance Role
+  # Assumed by the container instances running inside the App Runner service.
+  # The trust policy explicitly restricts assume-role to the App Runner service
+  # principal to prevent unintended lateral movement.
+  # ===========================================================================
+  AppRunnerInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "bookworm-apprunner-instance-role-${Environment}"
+      Description: >
+        Runtime role for the BookWorm App Runner service.  Grants the minimum
+        permissions required: read secrets, write traces and logs, pull images.
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowAppRunnerInstanceAssume
+            Effect: Allow
+            Principal:
+              Service: tasks.apprunner.amazonaws.com
+            Action: sts:AssumeRole
+      # Inline policy keeps all permissions in one place and avoids
+      # accidental detachment of a managed policy.
+      Policies:
+        - PolicyName: BookWormInstancePolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+
+              # ── Secrets Manager: read-only on bookworm/<env>/* ────────────
+              # The application reads secrets at startup via spring-cloud-aws.
+              # DescribeSecret is also required by the SDK to resolve by name.
+              - Sid: ReadSecrets
+                Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:DescribeSecret
+                Resource:
+                  - !Sub "arn:aws:secretsmanager:${AwsRegion}:${AWS::AccountId}:secret:${SecretsManagerPathPrefix}/${Environment}/*"
+
+              # ── X-Ray: write traces and telemetry ────────────────────────
+              # Must be * resource (X-Ray does not support resource-level ARNs)
+              - Sid: WriteXRayTraces
+                Effect: Allow
+                Action:
+                  - xray:PutTraceSegments
+                  - xray:PutTelemetryRecords
+                  - xray:GetSamplingRules
+                  - xray:GetSamplingTargets
+                  - xray:GetSamplingStatisticSummaries
+                Resource: "*"
+
+              # ── CloudWatch Logs: write to the two App Runner log groups ──
+              # CreateLogGroup is omitted — the groups are pre-created by the
+              # cloudwatch stack.  The instance role must not create log groups
+              # so that retention settings are enforced by CloudFormation only.
+              - Sid: WriteApplicationLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogStreams
+                Resource:
+                  - !Sub "arn:aws:logs:${AwsRegion}:${AWS::AccountId}:log-group:${CloudWatchLogGroupPrefix}-${Environment}:*"
+                  - !Sub "arn:aws:logs:${AwsRegion}:${AWS::AccountId}:log-group:${CloudWatchLogGroupPrefix}-${Environment}/*:*"
+
+              # ── ECR: pull images at deploy time ──────────────────────────
+              # GetAuthorizationToken must be * (account-level action).
+              - Sid: ECRGetToken
+                Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: "*"
+
+              - Sid: ECRPullImage
+                Effect: Allow
+                Action:
+                  - ecr:BatchGetImage
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchCheckLayerAvailability
+                Resource: !Ref ECRRepositoryArn
+
+      Tags:
+        - Key: Application
+          Value: bookworm-api
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ===========================================================================
+  # 2. App Runner Access Role
+  # Separate from the instance role — this role is assumed by the App Runner
+  # SERVICE CONTROL PLANE (not the container) to pull images from ECR and
+  # start the service.  AWS requires this for private ECR sources.
+  # ===========================================================================
+  AppRunnerAccessRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "bookworm-apprunner-access-role-${Environment}"
+      Description: >
+        App Runner service-level role (assumed by the App Runner control plane)
+        to pull images from ECR on behalf of the service.
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowAppRunnerServiceAssume
+            Effect: Allow
+            Principal:
+              Service: build.apprunner.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        # AWS-managed policy that grants App Runner the exact ECR permissions it
+        # needs.  Attaching it here instead of inlining reduces maintenance
+        # overhead if AWS updates the required permission set.
+        - arn:aws:iam::aws:policy/service-role/AWSAppRunnerServicePolicyForECRAccess
+      Tags:
+        - Key: Application
+          Value: bookworm-api
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ===========================================================================
+  # 3. CI/CD Role
+  # Assumed by CodeBuild (or GitHub Actions OIDC provider) to push images to
+  # ECR and trigger an App Runner service update.  It does NOT have any
+  # runtime permissions (no Secrets Manager, no X-Ray).
+  # ===========================================================================
+  CICDRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "bookworm-cicd-role-${Environment}"
+      Description: >
+        CI/CD pipeline role for building/pushing Docker images and deploying to
+        App Runner.  Scoped to the single ECR repository and App Runner service.
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          # Allow CodeBuild to assume this role
+          - Sid: AllowCodeBuildAssume
+            Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+          # Optionally allow GitHub Actions via OIDC (add OIDC provider ARN)
+          # Uncomment and add your GitHub OIDC provider ARN to enable:
+          # - Sid: AllowGitHubActionsOIDC
+          #   Effect: Allow
+          #   Principal:
+          #     Federated: "arn:aws:iam::ACCOUNT_ID:oidc-provider/token.actions.githubusercontent.com"
+          #   Action: sts:AssumeRoleWithWebIdentity
+          #   Condition:
+          #     StringEquals:
+          #       "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
+          #     StringLike:
+          #       "token.actions.githubusercontent.com:sub": "repo:YOUR_ORG/bookworm-api:*"
+      Policies:
+        - PolicyName: BookWormCICDPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+
+              # ── ECR: push new images ──────────────────────────────────────
+              - Sid: ECRGetToken
+                Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: "*"
+
+              - Sid: ECRPushImage
+                Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:PutImage
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                  - ecr:BatchGetImage
+                  - ecr:DescribeImages
+                Resource: !Ref ECRRepositoryArn
+
+              # ── App Runner: trigger a service update ─────────────────────
+              # Scoped to the specific service ARN when available; falls back
+              # to env-scoped wildcard on first deploy before the service exists.
+              - Sid: AppRunnerDeploy
+                Effect: Allow
+                Action:
+                  - apprunner:UpdateService
+                  - apprunner:DescribeService
+                Resource: !If
+                  - HasAppRunnerServiceArn
+                  - !Ref AppRunnerServiceArn
+                  - !Sub "arn:aws:apprunner:${AwsRegion}:${AWS::AccountId}:service/bookworm-api-${Environment}/*"
+
+              # ── CloudWatch Logs: write CodeBuild build logs ───────────────
+              - Sid: CodeBuildLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub "arn:aws:logs:${AwsRegion}:${AWS::AccountId}:log-group:/aws/codebuild/bookworm-*"
+                  - !Sub "arn:aws:logs:${AwsRegion}:${AWS::AccountId}:log-group:/aws/codebuild/bookworm-*:*"
+
+      Tags:
+        - Key: Application
+          Value: bookworm-api
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Outputs
+# ──────────────────────────────────────────────────────────────────────────────
+Outputs:
+  AppRunnerInstanceRoleArn:
+    Description: >
+      ARN of the App Runner instance role — supply to the App Runner service
+      InstanceConfiguration.InstanceRoleArn property.
+    Value: !GetAtt AppRunnerInstanceRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-AppRunnerInstanceRoleArn"
+
+  AppRunnerAccessRoleArn:
+    Description: >
+      ARN of the App Runner access role — supply to the App Runner service
+      SourceConfiguration.AuthenticationConfiguration.AccessRoleArn property.
+    Value: !GetAtt AppRunnerAccessRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-AppRunnerAccessRoleArn"
+
+  CICDRoleArn:
+    Description: ARN of the CI/CD pipeline role
+    Value: !GetAtt CICDRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-CICDRoleArn"

@@ -1,0 +1,18 @@
+[
+  { "ParameterKey": "Environment",                     "ParameterValue": "staging" },
+  { "ParameterKey": "AppRunnerServiceName",             "ParameterValue": "bookworm-api" },
+  { "ParameterKey": "DBInstanceIdentifier",             "ParameterValue": "bookworm-staging-primary" },
+  { "ParameterKey": "DBReplicaIdentifier",              "ParameterValue": "" },
+  { "ParameterKey": "PagerDutyAlarmEmail",              "ParameterValue": "" },
+  { "ParameterKey": "SlackAlarmEmail",                  "ParameterValue": "REPLACE_SLACK_EMAIL" },
+  { "ParameterKey": "LogKmsKeyArn",                     "ParameterValue": "" },
+  { "ParameterKey": "AppLogRetentionDays",              "ParameterValue": "14" },
+  { "ParameterKey": "SystemLogRetentionDays",           "ParameterValue": "7" },
+  { "ParameterKey": "RDSLogRetentionDays",              "ParameterValue": "7" },
+  { "ParameterKey": "Alarm5xxThresholdPct",             "ParameterValue": "2" },
+  { "ParameterKey": "AlarmP99LatencyThresholdMs",       "ParameterValue": "3000" },
+  { "ParameterKey": "AlarmRDSCpuThresholdPct",          "ParameterValue": "85" },
+  { "ParameterKey": "AlarmRDSConnectionsThreshold",     "ParameterValue": "60" },
+  { "ParameterKey": "AlarmRDSFreeStorageThresholdGB",   "ParameterValue": "10" },
+  { "ParameterKey": "AlarmReplicaLagThresholdSeconds",  "ParameterValue": "60" }
+]

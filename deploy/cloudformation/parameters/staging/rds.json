@@ -1,0 +1,18 @@
+[
+  { "ParameterKey": "Environment",               "ParameterValue": "staging" },
+  { "ParameterKey": "VpcId",                     "ParameterValue": "vpc-REPLACE" },
+  { "ParameterKey": "PrivateSubnet1Id",           "ParameterValue": "subnet-REPLACE-1a" },
+  { "ParameterKey": "PrivateSubnet2Id",           "ParameterValue": "subnet-REPLACE-1b" },
+  { "ParameterKey": "AppRunnerSecurityGroupId",   "ParameterValue": "sg-REPLACE" },
+  { "ParameterKey": "DBMasterUsername",           "ParameterValue": "bookworm_admin" },
+  { "ParameterKey": "DBMasterUserPassword",       "ParameterValue": "REPLACE_WITH_SECURE_VALUE" },
+  { "ParameterKey": "DBInstanceClass",            "ParameterValue": "db.t4g.small" },
+  { "ParameterKey": "ReplicaInstanceClass",       "ParameterValue": "db.t4g.micro" },
+  { "ParameterKey": "AllocatedStorageGB",         "ParameterValue": "50" },
+  { "ParameterKey": "MaxAllocatedStorageGB",      "ParameterValue": "200" },
+  { "ParameterKey": "MultiAZEnabled",             "ParameterValue": "false" },
+  { "ParameterKey": "CreateReadReplica",          "ParameterValue": "false" },
+  { "ParameterKey": "DeletionProtectionEnabled",  "ParameterValue": "false" },
+  { "ParameterKey": "BackupRetentionDays",        "ParameterValue": "3" },
+  { "ParameterKey": "KmsKeyId",                   "ParameterValue": "" }
+]

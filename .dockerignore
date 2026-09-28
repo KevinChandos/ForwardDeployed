@@ -1,0 +1,65 @@
+# =============================================================================
+# .dockerignore — files excluded from the Docker build context
+#
+# WHY this matters:
+#   Everything NOT listed here is sent to the Docker daemon as build context.
+#   A large context slows down every `docker build` and `docker compose up`.
+#   More importantly, excluding secrets and local configs prevents them from
+#   being accidentally baked into the image layer cache.
+# =============================================================================
+
+# ── Secrets & local config (NEVER include in image) ──────────────────────────
+.env
+.env.*
+!.env.example
+
+# ── Version control ──────────────────────────────────────────────────────────
+.git
+.gitignore
+.gitattributes
+
+# ── IDE and editor artefacts ──────────────────────────────────────────────────
+.idea/
+*.iml
+.vscode/
+*.code-workspace
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# ── Build output (re-created inside the builder stage) ───────────────────────
+# WHY: the multi-stage build compiles the source from scratch; shipping pre-built
+# target/ into the context would only bloat the context without being used.
+src/target/
+**/target/
+
+# ── Test artefacts ────────────────────────────────────────────────────────────
+src/test/
+**/*IT.java
+**/*Test.java
+**/test-classes/
+
+# ── Documentation & diagrams (not needed in the image) ───────────────────────
+README.md
+CHANGELOG.md
+Architecture/
+Wireframes/
+Requirements/
+API/
+
+# ── Local Maven wrapper (the builder stage uses the system Maven) ─────────────
+.mvn/
+mvnw
+mvnw.cmd
+
+# ── Docker files themselves (avoid confusion; already in build context root) ──
+docker-compose*.yml
+docker-compose*.override.yml
+
+# ── Other deployment artefacts not needed by the application image ─────────────
+deploy/postgres/
+Scripts/
+
+# ── Internal development logs ────────────────────────────────────────────────
+internal_monologue/

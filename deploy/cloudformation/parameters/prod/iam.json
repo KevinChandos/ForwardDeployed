@@ -1,0 +1,8 @@
+[
+  { "ParameterKey": "Environment",              "ParameterValue": "prod" },
+  { "ParameterKey": "AwsRegion",                "ParameterValue": "ap-southeast-2" },
+  { "ParameterKey": "ECRRepositoryArn",         "ParameterValue": "arn:aws:ecr:ap-southeast-2:ACCOUNT_ID:repository/bookworm/api" },
+  { "ParameterKey": "AppRunnerServiceArn",      "ParameterValue": "arn:aws:apprunner:ap-southeast-2:ACCOUNT_ID:service/bookworm-api-prod/SERVICE_ID" },
+  { "ParameterKey": "SecretsManagerPathPrefix", "ParameterValue": "bookworm" },
+  { "ParameterKey": "CloudWatchLogGroupPrefix", "ParameterValue": "/aws/apprunner/bookworm-api" }
+]

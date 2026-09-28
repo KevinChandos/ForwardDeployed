@@ -1,0 +1,295 @@
+# ============================================================
+# ci-cd-develop.yml
+# Purpose: CI/CD pipeline for the `develop` branch.
+# Triggers on push to `develop` (staging deployments).
+# Stages: Build → Unit Test → Integration Test → Sonar →
+#         Docker Build → Push to ECR → Deploy to App Runner (Staging)
+# Side effect: Deploys to STAGING environment on every push
+#              to develop. Quality gate enforced via Sonar.
+# ============================================================
+name: "CI/CD — Develop (Staging)"
+
+on:
+  push:
+    branches:
+      - develop
+
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "ECR image tag to deploy (leave blank for latest build)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+  APP_RUNNER_SERVICE_ARN: ${{ vars.APP_RUNNER_SERVICE_ARN_STAGING }}
+  ENVIRONMENT: staging
+  JAVA_VERSION: "21"
+  NODE_VERSION: "20"
+
+jobs:
+  # ----------------------------------------------------------
+  # JOB 1: Build
+  # ----------------------------------------------------------
+  build:
+    name: "Build"
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.meta.outputs.image_tag }}
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: temurin
+          cache: maven
+
+      - name: Generate build metadata
+        id: meta
+        run: |
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          echo "image_tag=${SHORT_SHA}-staging" >> "$GITHUB_OUTPUT"
+
+      - name: Build application
+        run: mvn --batch-mode clean package -DskipTests
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-artifact
+          path: target/*.jar
+          retention-days: 2
+
+  # ----------------------------------------------------------
+  # JOB 2: Unit Tests
+  # ----------------------------------------------------------
+  unit-test:
+    name: "Unit Tests"
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: temurin
+          cache: maven
+
+      - name: Run unit tests
+        run: mvn --batch-mode test -Dgroups="unit"
+
+      - name: Upload Surefire reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-test-reports
+          path: target/surefire-reports/
+
+      - name: Upload JaCoCo coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: jacoco-report
+          path: target/site/jacoco/
+
+  # ----------------------------------------------------------
+  # JOB 3: Integration Tests
+  # ----------------------------------------------------------
+  integration-test:
+    name: "Integration Tests"
+    runs-on: ubuntu-latest
+    needs: build
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: ${{ secrets.TEST_DB_NAME }}
+          POSTGRES_USER: ${{ secrets.TEST_DB_USER }}
+          POSTGRES_PASSWORD: ${{ secrets.TEST_DB_PASSWORD }}
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: temurin
+          cache: maven
+
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: build-artifact
+          path: target/
+
+      - name: Run integration tests
+        env:
+          SPRING_DATASOURCE_URL: jdbc:postgresql://localhost:5432/${{ secrets.TEST_DB_NAME }}
+          SPRING_DATASOURCE_USERNAME: ${{ secrets.TEST_DB_USER }}
+          SPRING_DATASOURCE_PASSWORD: ${{ secrets.TEST_DB_PASSWORD }}
+        run: mvn --batch-mode verify -Dgroups="integration" -DskipUnitTests
+
+      - name: Upload Failsafe reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-test-reports
+          path: target/failsafe-reports/
+
+  # ----------------------------------------------------------
+  # JOB 4: SonarCloud Analysis
+  # ----------------------------------------------------------
+  sonar:
+    name: "SonarCloud Analysis"
+    runs-on: ubuntu-latest
+    needs: [unit-test, integration-test]
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: temurin
+          cache: maven
+
+      - name: Download JaCoCo coverage report
+        uses: actions/download-artifact@v4
+        with:
+          name: jacoco-report
+          path: target/site/jacoco/
+
+      - name: Run SonarCloud scan
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mvn --batch-mode sonar:sonar \
+            -Dsonar.projectKey=${{ vars.SONAR_PROJECT_KEY }} \
+            -Dsonar.organization=${{ vars.SONAR_ORGANIZATION }} \
+            -Dsonar.host.url=https://sonarcloud.io \
+            -Dsonar.coverage.jacoco.xmlReportPaths=target/site/jacoco/jacoco.xml \
+            -Dsonar.qualitygate.wait=true \
+            -Dsonar.branch.name=develop
+
+  # ----------------------------------------------------------
+  # JOB 5: Docker Build & Push to ECR
+  # ----------------------------------------------------------
+  docker-build-push:
+    name: "Docker Build & Push to ECR"
+    runs-on: ubuntu-latest
+    needs: sonar
+    outputs:
+      image_uri: ${{ steps.push.outputs.image_uri }}
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: build-artifact
+          path: target/
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push Docker image
+        id: push
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ needs.build.outputs.image_tag }}
+        run: |
+          IMAGE_URI="${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
+          docker buildx build \
+            --platform linux/amd64 \
+            --tag "${IMAGE_URI}" \
+            --tag "${ECR_REGISTRY}/${ECR_REPOSITORY}:latest-staging" \
+            --build-arg BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --build-arg GIT_COMMIT="${GITHUB_SHA}" \
+            --provenance=false \
+            --push \
+            .
+          echo "image_uri=${IMAGE_URI}" >> "$GITHUB_OUTPUT"
+
+  # ----------------------------------------------------------
+  # JOB 6: Deploy to AWS App Runner (Staging)
+  # ----------------------------------------------------------
+  deploy-staging:
+    name: "Deploy to App Runner — Staging"
+    runs-on: ubuntu-latest
+    needs: docker-build-push
+    environment:
+      name: staging
+      url: ${{ vars.STAGING_URL }}
+    steps:
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Start App Runner deployment
+        run: |
+          OPERATION_ID=$(aws apprunner start-deployment \
+            --service-arn "$APP_RUNNER_SERVICE_ARN" \
+            --query 'OperationId' \
+            --output text)
+          echo "Deployment started — Operation ID: ${OPERATION_ID}"
+
+      - name: Wait for App Runner service to reach RUNNING
+        run: |
+          for i in $(seq 1 30); do
+            STATUS=$(aws apprunner describe-service \
+              --service-arn "$APP_RUNNER_SERVICE_ARN" \
+              --query 'Service.Status' \
+              --output text)
+            echo "  Attempt ${i}/30 — Status: ${STATUS}"
+            if [ "$STATUS" = "RUNNING" ]; then
+              echo "Service is RUNNING."
+              exit 0
+            elif [ "$STATUS" = "OPERATION_IN_PROGRESS" ]; then
+              sleep 20
+            else
+              echo "Unexpected service status: ${STATUS}."
+              exit 1
+            fi
+          done
+          echo "Timeout waiting for RUNNING status."
+          exit 1
